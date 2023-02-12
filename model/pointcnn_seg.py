@@ -198,7 +198,7 @@ class PointCNNSeg(LightningModule):
         y_hat = self(x)
         y_hat = y_hat.type(torch.float)
         y_one_hot = F.one_hot(y, num_classes=self.num_classes).type(torch.float).permute((0, 2, 1))
-        loss = F.cross_entropy(y_hat, y_one_hot)
+        loss = F.cross_entropy(y_hat, y_one_hot, ignore_index=-1)
         pred = F.softmax(y_hat.permute((0, 2, 1)), dim=-1)
         pred_idxs = torch.argmax(pred, dim=-1)
         intersection, union, target = intersection_union_gpu(pred_idxs, y, self.num_classes)
