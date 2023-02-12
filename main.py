@@ -17,6 +17,9 @@ if __name__ == '__main__':
     parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--num_classes", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--api", type=str)
+    parser.add_argument("--tag", type=str)
+    parser.add_argument("--wandb_user", type=str)
     args = parser.parse_args()
     data_path = args.data
     num_classes = args.num_classes

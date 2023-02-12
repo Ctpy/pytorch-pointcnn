@@ -176,10 +176,10 @@ class PointCNNSeg(LightningModule):
         # self.log('train_mIoU_step', m_iou)
         # self.log('train_loss_step', loss)
         # self.log('train_acc_step', self.train_accuracy)
-        return {'loss': loss, 'train_mIoU': m_iou, 'train_acc_step': self.train_accuracy}
+        return {'loss': loss, 'train_mIoU': m_iou, 'train_acc_step': self.train_accuracy, 'train_class_iou': iou_class}
 
     def training_epoch_end(self, outputs: EPOCH_OUTPUT) -> None:
-        result = {'loss': 0, 'train_mIoU': 0, 'train_acc_step': 0}
+        result = {'loss': 0, 'train_mIoU': 0, 'train_acc_step': 0, 'train_class_iou': torch.zeros(self.num_classes).to(self.device)}
         for item in outputs:
             for k, v in item.items():
                 if k != 'train_acc_step':
@@ -187,9 +187,11 @@ class PointCNNSeg(LightningModule):
         for k, v in result.items():
             if k != 'train_acc_step':
                 result[k] = result[k] / len(outputs)
+        for i in range(self.num_classes):
+            self.log(f'train_iou_class_{i}_epoch', result['train_class_iou'][i])
         self.log('train_mIoU_epoch', result['train_mIoU'], on_step=False, on_epoch=True)
         self.log('train_loss_epoch', result['loss'], on_step=False, on_epoch=True)
-        self.log('train_acc_epoch', outputs[-1]['train_acc_step'], on_step=False, on_epoch=True)
+        self.log('train_acc_epoch', outputs[-2]['train_acc_step'], on_step=False, on_epoch=True)
 
     def validation_step(self, batch, batch_idx):
         x, y = batch['pcd'], batch['label']
@@ -204,10 +206,10 @@ class PointCNNSeg(LightningModule):
         iou = torch.sum(intersection) / torch.sum(union + 1e-10)
         m_iou = torch.mean(iou)
         self.train_accuracy.update(pred_idxs, y)
-        return {'loss': loss, 'val_mIoU': m_iou, 'val_acc_step': self.train_accuracy}
+        return {'loss': loss, 'val_mIoU': m_iou, 'val_acc_step': self.train_accuracy, 'val_class_iou': iou_class}
 
     def validation_epoch_end(self, outputs: Union[EPOCH_OUTPUT, List[EPOCH_OUTPUT]]) -> None:
-        result = {'loss': 0, 'val_mIoU': 0, 'val_acc_step': 0}
+        result = {'loss': 0, 'val_mIoU': 0, 'val_acc_step': 0, 'val_class_iou': torch.zeros(self.num_classes).to(self.device)}
         for item in outputs:
             for k, v in item.items():
                 if k != 'val_acc_step':
@@ -215,9 +217,11 @@ class PointCNNSeg(LightningModule):
         for k, v in result.items():
             if k != 'val_acc_step':
                 result[k] = result[k] / len(outputs)
+        for i in range(self.num_classes):
+            self.log(f'val_iou_class_{i}_epoch', result['val_class_iou'][i])
         self.log('val_mIoU_epoch', result['val_mIoU'], on_step=False, on_epoch=True)
         self.log('val_loss_epoch', result['loss'], on_step=False, on_epoch=True)
-        self.log('val_acc_epoch', outputs[-1]['val_acc_step'], on_step=False, on_epoch=True)
+        self.log('val_acc_epoch', outputs[-2]['val_acc_step'], on_step=False, on_epoch=True)
 
     def test_step(self, batch, batch_idx):
         x, y = batch['pcd'], batch['label']
