@@ -1,7 +1,12 @@
+from typing import List, Union
+
 import torch
 import torchmetrics
 import torch.nn as nn
 import torch.nn.functional as F
+from pytorch_lightning.utilities.types import EPOCH_OUTPUT
+
+from model.utils.iou import *
 from torch_geometric.nn import XConv, fps, knn_interpolate
 from pytorch_lightning import LightningModule
 
@@ -14,10 +19,14 @@ def down_sample_layer(x, pose, batch, ratio=0.375):
 
 class PointCNNSeg(LightningModule):
 
-    def __init__(self, num_classes):
+    def __init__(self, num_classes, weight_balance=None):
         super(PointCNNSeg, self).__init__()
 
         self.num_classes = num_classes
+        if weight_balance is not None:
+            self.weight_balance = torch.tensor(weight_balance)
+        else:
+            self.weight_balance = weight_balance
         layers_D = [64, 128, 256, 512]
         hidden_D = [int((0 + layers_D[0]) / 2), int((layers_D[0] + layers_D[1]) / 2),
                     int((layers_D[1] + layers_D[2]) / 2), int((layers_D[2] + layers_D[3]) / 2)]
@@ -44,18 +53,21 @@ class PointCNNSeg(LightningModule):
         self.down_sampler = down_sample_layer
 
         ##head because of in pytorch geometric we can't use batch dimention like [1,num_classes,number_of_point] we cant use nn.sequential
-        self.fc_lyaer1 = nn.Conv1d(layers_U[3], 128, kernel_size=1, bias=False)
+        self.fc_layer1 = nn.Conv1d(layers_U[3], 128, kernel_size=1, bias=False)
         self.Relu = nn.ReLU(True)
         self.DROP = nn.Dropout(0.5)
-        self.fc_lyaer2 = nn.Conv1d(128, self.num_classes, kernel_size=1)
+        self.fc_layer2 = nn.Conv1d(128, self.num_classes, kernel_size=1)
 
         self.batch_size = 16
         self.number_of_point = 2048
-        self.train_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=5)
-        self.test_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=5)
+        self.train_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=self.num_classes)
+        self.val_accuary = torchmetrics.Accuracy(task="multiclass", num_classes=self.num_classes)
+        self.test_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=self.num_classes)
 
     # pytorch geometric layer need batch and pos as input batch is like batch = [1,1,2,2,3,3] means firest data is batch 1
     # and second data is batch 2 and so on
+
+
     def pre_pointcnn(self, points):
 
         self.batch_size = points.shape[0]
@@ -134,10 +146,10 @@ class PointCNNSeg(LightningModule):
         X_OUT = torch.unsqueeze(xo1_after_mlp.T, 0)
         # X_OUT = self.BN(X_OUT)
 
-        X_OUT = self.fc_lyaer1(xo1_after_mlp)
+        X_OUT = self.fc_layer1(xo1_after_mlp)
         X_OUT = self.Relu(X_OUT)
         X_OUT = self.DROP(X_OUT)
-        X_OUT = self.fc_lyaer2(X_OUT)
+        X_OUT = self.fc_layer2(X_OUT)
 
         X_OUT = self.after_pred(X_OUT, batch=batch0)
 
@@ -146,19 +158,66 @@ class PointCNNSeg(LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch['pcd'], batch['label']
         y_hat = self(x)
-        y_hat = y_hat.view(y.size()[0], y.size()[1], -1).type(torch.float)
-        y_one_hot = F.one_hot(y, num_classes=5).type(torch.float)
-        loss = F.cross_entropy(y_hat, y_one_hot)
-        pred = F.softmax(y_hat, dim=-1)
+        y_hat = y_hat.type(torch.float)
+        y_one_hot = F.one_hot(y, num_classes=self.num_classes).type(torch.float).permute((0, 2, 1))
+        if self.weight_balance is None:
+            loss = F.cross_entropy(y_hat, y_one_hot)
+        else:
+            loss = F.cross_entropy(y_hat, y_one_hot, weight=self.weight_balance.type(torch.float32).to(self.device), ignore_index=-1)
+        pred = F.softmax(y_hat.permute((0, 2, 1)), dim=-1)
         pred_idxs = torch.argmax(pred, dim=-1)
+        intersection, union, target = intersection_union_gpu(pred_idxs, y, self.num_classes)
+        iou_class = intersection / (union + 1e-10)
+        iou = torch.sum(intersection) / torch.sum(union + 1e-10)
+        m_iou = torch.mean(iou)
         self.train_accuracy.update(pred_idxs, y)
-        self.log('train_loss', loss)
-        self.log('train_acc_step', self.train_accuracy)
-        return loss
+        # for i in range(self.num_classes):
+        #    self.log(f'train_iou_class_{i}_step', iou_class[i])
+        # self.log('train_mIoU_step', m_iou)
+        # self.log('train_loss_step', loss)
+        # self.log('train_acc_step', self.train_accuracy)
+        return {'loss': loss, 'train_mIoU': m_iou, 'train_acc_step': self.train_accuracy}
 
-    def training_epoch_end(self, outs):
-        # log epoch metric
-        self.log('train_acc_epoch', self.train_accuracy)
+    def training_epoch_end(self, outputs: EPOCH_OUTPUT) -> None:
+        result = {'loss': 0, 'train_mIoU': 0, 'train_acc_step': 0}
+        for item in outputs:
+            for k, v in item.items():
+                if k != 'train_acc_step':
+                    result[k] += v
+        for k, v in result.items():
+            if k != 'train_acc_step':
+                result[k] = result[k] / len(outputs)
+        self.log('train_mIoU_epoch', result['train_mIoU'], on_step=False, on_epoch=True)
+        self.log('train_loss_epoch', result['loss'], on_step=False, on_epoch=True)
+        self.log('train_acc_epoch', outputs[-1]['train_acc_step'], on_step=False, on_epoch=True)
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch['pcd'], batch['label']
+        y_hat = self(x)
+        y_hat = y_hat.type(torch.float)
+        y_one_hot = F.one_hot(y, num_classes=self.num_classes).type(torch.float).permute((0, 2, 1))
+        loss = F.cross_entropy(y_hat, y_one_hot)
+        pred = F.softmax(y_hat.permute((0, 2, 1)), dim=-1)
+        pred_idxs = torch.argmax(pred, dim=-1)
+        intersection, union, target = intersection_union_gpu(pred_idxs, y, self.num_classes)
+        iou_class = intersection / (union + 1e-10)
+        iou = torch.sum(intersection) / torch.sum(union + 1e-10)
+        m_iou = torch.mean(iou)
+        self.train_accuracy.update(pred_idxs, y)
+        return {'loss': loss, 'val_mIoU': m_iou, 'val_acc_step': self.train_accuracy}
+
+    def validation_epoch_end(self, outputs: Union[EPOCH_OUTPUT, List[EPOCH_OUTPUT]]) -> None:
+        result = {'loss': 0, 'val_mIoU': 0, 'val_acc_step': 0}
+        for item in outputs:
+            for k, v in item.items():
+                if k != 'val_acc_step':
+                    result[k] += v
+        for k, v in result.items():
+            if k != 'val_acc_step':
+                result[k] = result[k] / len(outputs)
+        self.log('val_mIoU_epoch', result['val_mIoU'], on_step=False, on_epoch=True)
+        self.log('val_loss_epoch', result['loss'], on_step=False, on_epoch=True)
+        self.log('val_acc_epoch', outputs[-1]['val_acc_step'], on_step=False, on_epoch=True)
 
     def test_step(self, batch, batch_idx):
         x, y = batch['pcd'], batch['label']
@@ -182,5 +241,5 @@ class PointCNNSeg(LightningModule):
         return pred_idxs
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = torch.optim.Adam(self.parameters(), lr=(1e-3))
         return optimizer
